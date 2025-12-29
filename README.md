@@ -5,7 +5,7 @@
  Features
 - **Reversible gates only** (Peres, Feynman,)
 - **Vedic 8×8 multiplier** with reversible adders
-- **Hamming(21,16)** - corrects 1-bit errors, detects 2-bit error
+- **Hamming(21,16)** - corrects 1-bit errors
 
 
   
