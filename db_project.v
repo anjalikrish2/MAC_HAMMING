@@ -1,28 +1,3 @@
-`timescale 1ns / 1ps
-//////////////////////////////////////////////////////////////////////////////////
-// Company: 
-// Engineer: 
-// 
-// Create Date: 12/26/2025 07:50:23 PM
-// Design Name: 
-// Module Name: db_project
-// Project Name: 
-// Target Devices: 
-// Tool Versions: 
-// Description: 
-// 
-// Dependencies: 
-// 
-// Revision:
-// Revision 0.01 - File Created
-// Additional Comments:
-// 
-//////////////////////////////////////////////////////////////////////////////////
-/*
- * Copyright (c) 2024 Your Name
- * SPDX-License-Identifier: Apache-2.0
- */
-
 `default_nettype none
 
 module tt_um_db_MAC (
@@ -38,28 +13,25 @@ module tt_um_db_MAC (
 
     // Error detection/correction ports
     input  wire       err_clear,       // Clear latched errors and count
-    output wire       err_mult,        // Multiplier error detected (latched)
-    output wire       err_adder,       // Adder error detected (latched)
-    output wire       err_tmr,         // TMR mismatch detected (latched)
-    output wire       err_corrected,   // TMR corrected error (current cycle)
+    output wire       err_detected,    // Error detected in current cycle
+    output wire       err_corrected,   // Error corrected in current cycle
     output wire [3:0] err_count,       // Rolling error count (saturates at 15)
     output wire [7:0] err_last_cycle   // Cycle when last error occurred
 );
 
 reg [7:0] reg_a, reg_b;
 wire [15:0] W, Sum;
-wire mult_parity_err, adder_parity_err;
 
-// TMR accumulator registers
-reg [15:0] Out_0, Out_1, Out_2;
-wire [15:0] Out_voted;
-wire tmr_error, tmr_corrected;
+// Hammming encoding/decoding signals
+wire [20:0] Out_encoded;
+wire [15:0] Out_decoded;
+wire hamming_err_detected, hamming_err_corrected;
+reg [20:0] Out_encoded_reg;
 
 // Error status registers
 reg [3:0] error_count;
 reg [7:0] last_error_cycle;
 reg [7:0] cycle_counter;
-reg err_mult_latched, err_adder_latched, err_tmr_latched;
 
 assign uio_oe = clk ? 8'hFF : 8'h00;
 
@@ -83,44 +55,42 @@ always @(posedge clk or negedge rst_n) begin
     end
 end
 
-// Vedic multiplier with parity error detection
-vedic_8bit_multiplier_ecc m1(
+// Vedic multiplier
+vedic_8bit_multiplier m1(
     .A(reg_a),
     .B(reg_b),
-    .P(W),
-    .parity_error(mult_parity_err)
+    .P(W)
 );
 
-// Reversible 16-bit adder with parity checking
-reversible_16bit_adder_ecc a1(
-    .A(Out_voted),
+// Reversible 16-bit adder
+reversible_16bit_adder a1(
+    .A(Out_decoded),
     .B(W),
     .Cin(1'b0),
-    .Sum(Sum),
-    .parity_error(adder_parity_err)
+    .Sum(Sum)
 );
 
-// TMR Majority Voter
-tmr_voter #(.WIDTH(16)) voter_inst (
-    .in0(Out_0),
-    .in1(Out_1),
-    .in2(Out_2),
-    .out(Out_voted),
-    .error(tmr_error),
-    .corrected(tmr_corrected)
+// Hamming encoder for accumulator storage
+hamming_21_16_encoder_peres encoder_inst(
+    .data_in(Sum),
+    .encoded(Out_encoded),
+    .garbage_out()
 );
 
-// TMR accumulator update on negedge
+// Hamming decoder for accumulator retrieval
+hamming_21_16_decoder_peres decoder_inst(
+    .encoded_in(Out_encoded_reg),
+    .data_out(Out_decoded),
+    .error_detected(hamming_err_detected),
+    .error_corrected(hamming_err_corrected),
+    .garbage_out()
+);
+
 always @(negedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        Out_0 <= 16'b0;
-        Out_1 <= 16'b0;
-        Out_2 <= 16'b0;
-    end else begin
-        Out_0 <= Sum;
-        Out_1 <= Sum;
-        Out_2 <= Sum;
-    end
+    if (!rst_n)
+        Out_encoded_reg <= 21'd0;
+    else
+        Out_encoded_reg <= Out_encoded;
 end
 
 // Error latching and counting
@@ -128,73 +98,29 @@ always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         error_count <= 4'b0;
         last_error_cycle <= 8'b0;
-        err_mult_latched <= 1'b0;
-        err_adder_latched <= 1'b0;
-        err_tmr_latched <= 1'b0;
     end else if (err_clear) begin
-        err_mult_latched <= 1'b0;
-        err_adder_latched <= 1'b0;
-        err_tmr_latched <= 1'b0;
         error_count <= 4'b0;
     end else begin
-        if (mult_parity_err) err_mult_latched <= 1'b1;
-        if (adder_parity_err) err_adder_latched <= 1'b1;
-        if (tmr_error) err_tmr_latched <= 1'b1;
-
-        if (mult_parity_err || adder_parity_err || tmr_error) begin
-            if (error_count != 4'hF) error_count <= error_count + 4'b1;
+        if (hamming_err_detected) begin
+            if (error_count != 4'hF)
+                error_count <= error_count + 1;
             last_error_cycle <= cycle_counter;
         end
     end
 end
 
 // MAC result output (always active, parallel with error detection)
-assign {uio_out, uo_out} = Out_voted;
+assign {uio_out, uo_out} = Out_decoded;
 
 // Error status outputs
-assign err_mult       = err_mult_latched;
-assign err_adder      = err_adder_latched;
-assign err_tmr        = err_tmr_latched;
-assign err_corrected  = tmr_corrected;
+assign err_detected   = hamming_err_detected;
+assign err_corrected  = hamming_err_corrected;
 assign err_count      = error_count;
 assign err_last_cycle = last_error_cycle;
 
 wire _unused = &{ena, 1'b0};
 
 endmodule
-
-
-//=============================================================================
-// TMR Majority Voter
-//=============================================================================
-module tmr_voter #(
-    parameter WIDTH = 16
-)(
-    input  wire [WIDTH-1:0] in0,
-    input  wire [WIDTH-1:0] in1,
-    input  wire [WIDTH-1:0] in2,
-    output wire [WIDTH-1:0] out,
-    output wire error,
-    output wire corrected
-);
-
-// Bitwise majority vote: out[i] = (in0[i] & in1[i]) | (in1[i] & in2[i]) | (in0[i] & in2[i])
-assign out = (in0 & in1) | (in1 & in2) | (in0 & in2);
-
-// Error if any input differs from voted output
-wire err0 = |(in0 ^ out);
-wire err1 = |(in1 ^ out);
-wire err2 = |(in2 ^ out);
-
-assign error = err0 | err1 | err2;
-
-// Corrected if exactly one differs (single bit flip correctable)
-assign corrected = error && ((err0 && !err1 && !err2) ||
-                             (!err0 && err1 && !err2) ||
-                             (!err0 && !err1 && err2));
-
-endmodule
-
 
 module BVPPG_gate (
     input  wire A,
@@ -448,50 +374,175 @@ module vedic_8bit_multiplier (
 endmodule
 
 
-//=============================================================================
-// ECC Wrapper: Vedic 8-bit Multiplier with Parity Error Detection
-//=============================================================================
-module vedic_8bit_multiplier_ecc (
-    input  wire [7:0] A,
-    input  wire [7:0] B,
-    output wire [15:0] P,
-    output wire parity_error
+module peres_multi_xor #(
+    parameter WIDTH = 4
+)(
+    input  wire [WIDTH-1:0] inputs,
+    output wire result,
+    output wire [WIDTH-1:0] garbage
 );
-
-// Main multiplier
-vedic_8bit_multiplier mult_inst(.A(A), .B(B), .P(P));
-
-// Shadow computation on 2-bit slices for verification
-wire [3:0] shadow_p0;
-vedic_2bit_multiplier shadow_u0(A[1:0], B[1:0], shadow_p0);
-
-// Compare shadow result with main result LSBs
-assign parity_error = (shadow_p0[1:0] != P[1:0]);
-
+    wire [WIDTH:0] cascade;
+    assign cascade[0] = 1'b0;
+    
+    genvar i;
+    generate
+        for (i = 0; i < WIDTH; i = i + 1) 
+        begin : xor_chain
+            wire p_temp = cascade[i];
+            wire q_temp = cascade[i] ^ inputs[i];
+            wire r_temp = (cascade[i] & inputs[i]);
+            
+            assign cascade[i+1] = q_temp;
+            assign garbage[i] = r_temp;
+        end
+    endgenerate
+    
+    assign result = cascade[WIDTH];
 endmodule
 
 
-//=============================================================================
-// ECC Wrapper: Reversible 16-bit Adder with Parity Error Detection
-//=============================================================================
-module reversible_16bit_adder_ecc (
-    input  wire [15:0] A,
-    input  wire [15:0] B,
-    input  wire        Cin,
-    output wire [15:0] Sum,
-    output wire        parity_error
+module hamming_21_16_encoder_peres (
+    input  wire [15:0] data_in,
+    output wire [20:0] encoded,
+    output wire [39:0] garbage_out
 );
+    
+    wire [9:0] p1_inputs = {data_in[15], data_in[13], data_in[11], data_in[10], data_in[8], data_in[6], data_in[4], data_in[3], data_in[1], data_in[0]};
+    wire p1;
+    wire [9:0] p1_garbage;
+    peres_multi_xor #(.WIDTH(10)) calc_p1 (
+        .inputs(p1_inputs), .result(p1), .garbage(p1_garbage)
+    );
+    
+    
+    wire [8:0] p2_inputs = {data_in[13], data_in[12], data_in[10], data_in[9], data_in[6], data_in[5], data_in[3], data_in[2], data_in[0]};
+    wire p2;
+    wire [8:0] p2_garbage;
+    peres_multi_xor #(.WIDTH(9)) calc_p2 (
+        .inputs(p2_inputs), .result(p2), .garbage(p2_garbage)
+    );
+    
+   
+    wire [8:0] p4_inputs = {data_in[15], data_in[14], data_in[10], data_in[9], data_in[8], data_in[7], data_in[3], data_in[2], data_in[1]};
+    wire p4;
+    wire [8:0] p4_garbage;
+    peres_multi_xor #(.WIDTH(9)) calc_p4 (
+        .inputs(p4_inputs), .result(p4), .garbage(p4_garbage)
+    );
+    
+    
+    wire [6:0] p8_inputs = {data_in[10], data_in[9], data_in[8], data_in[7], data_in[6], data_in[5], data_in[4]};
+    wire p8;
+    wire [6:0] p8_garbage;
+    peres_multi_xor #(.WIDTH(7)) calc_p8 (
+        .inputs(p8_inputs), .result(p8), .garbage(p8_garbage)
+    );
+    
+    
+    wire [4:0] p16_inputs = {data_in[15], data_in[14], data_in[13], data_in[12], data_in[11]};
+    wire p16;
+    wire [4:0] p16_garbage;
+    peres_multi_xor #(.WIDTH(5)) calc_p16 (
+        .inputs(p16_inputs), .result(p16), .garbage(p16_garbage)
+    );
+    
+    
+    assign encoded = {
+        data_in[15], data_in[14], data_in[13], data_in[12], data_in[11], p16, data_in[10], data_in[9], data_in[8], data_in[7], data_in[6], data_in[5], data_in[4], p8, data_in[3], data_in[2], data_in[1], p4, data_in[0], p2, p1
+    };
+    
+    assign garbage_out = {p16_garbage, p8_garbage, p4_garbage, p2_garbage, p1_garbage};
+endmodule
 
-// Main adder
-reversible_16bit_adder adder_inst(.A(A), .B(B), .Cin(Cin), .Sum(Sum));
 
-// Shadow 4-bit adder for verification
-wire [3:0] shadow_sum;
-wire shadow_carry;
-reversible_4bit_adder shadow_add(A[3:0], B[3:0], Cin, shadow_sum, shadow_carry);
-
-assign parity_error = (shadow_sum != Sum[3:0]);
-
-wire _unused_shadow = &{shadow_carry};
-
+module hamming_21_16_decoder_peres (
+    input  wire [20:0] encoded_in,
+    output wire [15:0] data_out,
+    output wire error_detected,
+    output wire error_corrected,
+    output wire [39:0] garbage_out
+);
+    
+    wire p1_rx  = encoded_in[0];
+    wire p2_rx  = encoded_in[1];
+    wire p4_rx  = encoded_in[3];
+    wire p8_rx  = encoded_in[7];
+    wire p16_rx = encoded_in[15];
+    
+    wire [15:0] data_rx = {
+        encoded_in[20], encoded_in[19], encoded_in[18], encoded_in[17],
+        encoded_in[16], encoded_in[14], encoded_in[13], encoded_in[12],
+        encoded_in[11], encoded_in[10], encoded_in[9],  encoded_in[8],
+        encoded_in[6],  encoded_in[5],  encoded_in[4],  encoded_in[2]
+    };
+    
+    
+    wire [9:0] p1_calc_inputs = {data_rx[15], data_rx[13], data_rx[11], data_rx[10], data_rx[8], data_rx[6], data_rx[4], data_rx[3], data_rx[1], data_rx[0]};
+    wire p1_calc;
+    wire [9:0] p1_calc_garbage;
+    peres_multi_xor #(.WIDTH(10)) recalc_p1 (
+        .inputs(p1_calc_inputs), .result(p1_calc), .garbage(p1_calc_garbage)
+    );
+    
+    wire [8:0] p2_calc_inputs = {data_rx[13], data_rx[12], data_rx[10], data_rx[9], data_rx[6], data_rx[5], data_rx[3], data_rx[2], data_rx[0]};
+    wire p2_calc;
+    wire [8:0] p2_calc_garbage;
+    peres_multi_xor #(.WIDTH(9)) recalc_p2 (
+        .inputs(p2_calc_inputs), .result(p2_calc), .garbage(p2_calc_garbage)
+    );
+    
+    wire [8:0] p4_calc_inputs = {data_rx[15], data_rx[14], data_rx[10], data_rx[9], data_rx[8], data_rx[7], data_rx[3], data_rx[2], data_rx[1]};
+    wire p4_calc;
+    wire [8:0] p4_calc_garbage;
+    peres_multi_xor #(.WIDTH(9)) recalc_p4 (
+        .inputs(p4_calc_inputs), .result(p4_calc), .garbage(p4_calc_garbage)
+    );
+    
+    wire [6:0] p8_calc_inputs = {data_rx[10], data_rx[9], data_rx[8], data_rx[7], data_rx[6], data_rx[5], data_rx[4]};
+    wire p8_calc;
+    wire [6:0] p8_calc_garbage;
+    peres_multi_xor #(.WIDTH(7)) recalc_p8 (
+        .inputs(p8_calc_inputs), .result(p8_calc), .garbage(p8_calc_garbage)
+    );
+    
+    wire [4:0] p16_calc_inputs = {data_rx[15], data_rx[14], data_rx[13], data_rx[12], data_rx[11]};
+    wire p16_calc;
+    wire [4:0] p16_calc_garbage;
+    peres_multi_xor #(.WIDTH(5)) recalc_p16 (
+        .inputs(p16_calc_inputs), .result(p16_calc), .garbage(p16_calc_garbage)
+    );
+    
+    
+    wire [4:0] syndrome = {
+        p16_calc ^ p16_rx,
+        p8_calc  ^ p8_rx,
+        p4_calc  ^ p4_rx,
+        p2_calc  ^ p2_rx,
+        p1_calc  ^ p1_rx
+    };
+    
+    assign error_detected = (syndrome != 5'b00000);
+    assign error_corrected = error_detected;
+    
+   
+    wire [15:0] data_corrected;
+    assign data_corrected[0]  = (syndrome == 5'd3)  ? ~data_rx[0]  : data_rx[0];
+    assign data_corrected[1]  = (syndrome == 5'd5)  ? ~data_rx[1]  : data_rx[1];
+    assign data_corrected[2]  = (syndrome == 5'd6)  ? ~data_rx[2]  : data_rx[2];
+    assign data_corrected[3]  = (syndrome == 5'd7)  ? ~data_rx[3]  : data_rx[3];
+    assign data_corrected[4]  = (syndrome == 5'd9)  ? ~data_rx[4]  : data_rx[4];
+    assign data_corrected[5]  = (syndrome == 5'd10) ? ~data_rx[5]  : data_rx[5];
+    assign data_corrected[6]  = (syndrome == 5'd11) ? ~data_rx[6]  : data_rx[6];
+    assign data_corrected[7]  = (syndrome == 5'd12) ? ~data_rx[7]  : data_rx[7];
+    assign data_corrected[8]  = (syndrome == 5'd13) ? ~data_rx[8]  : data_rx[8];
+    assign data_corrected[9]  = (syndrome == 5'd14) ? ~data_rx[9]  : data_rx[9];
+    assign data_corrected[10] = (syndrome == 5'd15) ? ~data_rx[10] : data_rx[10];
+    assign data_corrected[11] = (syndrome == 5'd17) ? ~data_rx[11] : data_rx[11];
+    assign data_corrected[12] = (syndrome == 5'd18) ? ~data_rx[12] : data_rx[12];
+    assign data_corrected[13] = (syndrome == 5'd19) ? ~data_rx[13] : data_rx[13];
+    assign data_corrected[14] = (syndrome == 5'd20) ? ~data_rx[14] : data_rx[14];
+    assign data_corrected[15] = (syndrome == 5'd21) ? ~data_rx[15] : data_rx[15];
+    
+    assign data_out = data_corrected;
+    assign garbage_out = {p16_calc_garbage, p8_calc_garbage, p4_calc_garbage,p2_calc_garbage, p1_calc_garbage};
 endmodule
